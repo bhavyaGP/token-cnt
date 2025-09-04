@@ -54,13 +54,41 @@ function hasCodeChange(diff) {
 
 async function generateTests() {
   // Get changed JS files in the last commit
-  const rawChanged = execSync("git diff --name-only HEAD~1 HEAD")
-    .toString()
-    .split("\n")
-    .map((f) => f.trim())
-    .filter(Boolean);
+    // Get changed JS files in the last commit. Handle initial commit where HEAD~1 doesn't exist.
+    let rawChanged = [];
+    let commitCount = 0;
+    try {
+      commitCount = parseInt(execSync("git rev-list --count HEAD").toString().trim(), 10);
+    } catch (err) {
+      // If HEAD doesn't exist or other git error, treat as zero commits
+      commitCount = 0;
+    }
 
-  console.log("Changed files in the last commit:", rawChanged);
+    try {
+      if (commitCount <= 1) {
+        // Initial or zero-commit repo: list files in HEAD (first commit) if present
+        if (commitCount === 1) {
+          rawChanged = execSync("git show --name-only --pretty=\"\" HEAD")
+            .toString()
+            .split("\n")
+            .map((f) => f.trim())
+            .filter(Boolean);
+        } else {
+          rawChanged = [];
+        }
+      } else {
+        rawChanged = execSync("git diff --name-only HEAD~1 HEAD")
+          .toString()
+          .split("\n")
+          .map((f) => f.trim())
+          .filter(Boolean);
+      }
+    } catch (err) {
+      console.error("Failed to determine changed files:", err && err.message ? err.message : err);
+      return;
+    }
+
+    console.log("Changed files in the last commit:", rawChanged);
 
   const changedFiles = rawChanged
     .map((f) => f.replace(/\\/g, "/"))
@@ -81,13 +109,24 @@ async function generateTests() {
     if (!fs.existsSync(file)) continue;
 
     // Get file diff
-    const diff = execSync(`git diff HEAD~1 HEAD -- ${file}`).toString();
+    let diff = "";
+    try {
+      if (commitCount <= 1) {
+        // For initial commit assume file is new; skip diff-based filtering
+        diff = null;
+      } else {
+        diff = execSync(`git diff HEAD~1 HEAD -- ${file}`).toString();
+      }
+    } catch (err) {
+      console.warn(`Could not get diff for ${file}:`, err && err.message ? err.message : err);
+      diff = null;
+    }
     console.log("------------------");
     console.log(`\nProcessing file: ${file}`);
-    console.log("Diff:", diff);
+    if (diff !== null) console.log("Diff:", diff);
     console.log("------------------");
     // Check if diff contains real code changes
-    if (!hasCodeChange(diff)) {
+    if (diff !== null && !hasCodeChange(diff)) {
       console.log(`⏭️ Skipping ${file} (only comments/whitespace changed)`);
       continue;
     }
