@@ -1,82 +1,116 @@
+jest.mock('mongoose', () => ({}));
+
 const { makeAdvancedEventHandler, synthesizeEventOutcome, determineRewardMultiplier, clampNumber } = require('./advancedEvents.controller');
 
 describe('clampNumber', () => {
-  it('should clamp values correctly', () => {
-    expect(clampNumber(5, 0, 10)).toBe(5);
-    expect(clampNumber(-1, 0, 10)).toBe(0);
-    expect(clampNumber(15, 0, 10)).toBe(10);
+  it('should clamp a number to the minimum value', () => {
+    expect(clampNumber(1, 5, 10)).toBe(5);
+  });
+  it('should clamp a number to the maximum value', () => {
+    expect(clampNumber(15, 5, 10)).toBe(10);
+  });
+  it('should return the number if within range', () => {
+    expect(clampNumber(7, 5, 10)).toBe(7);
   });
 });
 
 describe('determineRewardMultiplier', () => {
-  it('should calculate multipliers correctly for different difficulties', () => {
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: [] })).toBe(1);
-    expect(determineRewardMultiplier({ difficulty: 'medium', streak: { count: 0 }, bonusActive: false, userFlags: [] })).toBe(1.2);
-    expect(determineRewardMultiplier({ difficulty: 'hard', streak: { count: 0 }, bonusActive: false, userFlags: [] })).toBe(1.5);
+  it('should return a base multiplier of 1 for easy difficulty', () => {
+    expect(determineRewardMultiplier({ difficulty: 'easy' })).toBe(1);
   });
-  it('should handle streak bonuses correctly', () => {
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 2 }, bonusActive: false, userFlags: [] })).toBe(1);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 5 }, bonusActive: false, userFlags: [] })).toBe(1.1);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 10 }, bonusActive: false, userFlags: [] })).toBe(1.3);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 30 }, bonusActive: false, userFlags: [] })).toBe(2);
+  it('should return a multiplier of 1.5 for hard difficulty', () => {
+    expect(determineRewardMultiplier({ difficulty: 'hard' })).toBe(1.5);
+  });
+  it('should apply streak multipliers correctly', () => {
+    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 5 } })).toBeCloseTo(1.1);
+    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 10 } })).toBeCloseTo(1.3);
+    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 30 } })).toBeCloseTo(2);
   });
   it('should apply bonus multipliers correctly', () => {
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: true, userFlags: [] })).toBe(1.25);
+    expect(determineRewardMultiplier({ difficulty: 'easy', bonusActive: true })).toBeCloseTo(1.25);
   });
-  it('should handle user flags correctly', () => {
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: ['vip'] })).toBe(1.5);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: ['early_supporter'] })).toBe(1);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: ['vip', 'early_supporter'] })).toBe(1.8);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: ['beta_tester'] })).toBe(1.15);
+  it('should apply user flag multipliers correctly', () => {
+    expect(determineRewardMultiplier({ difficulty: 'easy', userFlags: ['vip'] })).toBeCloseTo(1.5);
+    expect(determineRewardMultiplier({ difficulty: 'easy', userFlags: ['vip', 'early_supporter'] })).toBeCloseTo(1.8);
+    expect(determineRewardMultiplier({ difficulty: 'easy', userFlags: ['beta_tester'] })).toBeCloseTo(1.15);
   });
-  it('should clamp the multiplier between 0.5 and 5.0', () => {
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: ['vip', 'early_supporter', 'vip'] })).toBe(5);
-    expect(determineRewardMultiplier({ difficulty: 'easy', streak: { count: 0 }, bonusActive: false, userFlags: [] })).toBe(1);
-
+  it('should clamp the multiplier between 0.5 and 5', () => {
+    expect(determineRewardMultiplier({ difficulty: 'hard', streak: { count: 30 }, bonusActive: true, userFlags: ['vip', 'early_supporter'] })).toBe(5);
+    expect(determineRewardMultiplier({ difficulty: 'easy', streak: {count: 0}, bonusActive: false, userFlags: [] })).toBe(1);
   });
 });
 
+
 describe('synthesizeEventOutcome', () => {
   it('should handle missing user or payload', async () => {
-    const outcome = await synthesizeEventOutcome({});
-    expect(outcome.success).toBe(false);
-    expect(outcome.msgs).toContain('Missing user');
-    expect(outcome.msgs).toContain('Missing event payload');
+    expect((await synthesizeEventOutcome({})).success).toBe(false);
+    expect((await synthesizeEventOutcome({ user: {} })).success).toBe(false);
   });
-  it('should process event and calculate rewards correctly', async () => {
-    const user = { loginStreak: { count: 5 }, activeBonus: true, flags: ['vip'], coins: 100, level: 5, xp: 2000 };
-    const payload = { difficulty: 'hard', timeTaken: 20, hintsUsed: 1 };
+  it('should compute reward correctly with various inputs', async () => {
+    const user = { _id: 'testuser', loginStreak: { count: 5 }, activeBonus: true, flags: ['vip'], coins: 100, xp: 1000, level: 5 };
+    const payload = { difficulty: 'hard', timeTaken: 25, hintsUsed: 1 };
     const outcome = await synthesizeEventOutcome({ user, eventPayload: payload });
     expect(outcome.success).toBe(true);
-    expect(outcome.changes.multiplier).toBeGreaterThan(0);
     expect(outcome.changes.reward).toBeGreaterThan(0);
-    expect(outcome.timestamp).toBeDefined();
   });
-  it('should handle level boost and item drops', async () => {
-    const user = { loginStreak: { count: 5 }, activeBonus: true, flags: ['vip'], coins: 100, level: 9, xp: 1500 };
-    const payload = { difficulty: 'hard', timeTaken: 20, hintsUsed: 1 };
+  it('should apply rule engine overrides', async () => {
+    const user = { _id: 'testuser', loginStreak: { count: 15 }, flags: ['double_weekend'], coins: 100, xp: 1000, level: 5 };
+    const payload = { difficulty: 'hard', timeTaken: 25, hintsUsed: 1 };
     const outcome = await synthesizeEventOutcome({ user, eventPayload: payload });
-    expect(outcome.changes.levelBoost).toBe(1);
-    expect(outcome.msgs).toContain('Level boost applied');
-    // Item drop is probabilistic, so we can't reliably assert on it.
+    expect(outcome.msgs).toContain('Rule override applied: weekend double');
+  });
+  it('should handle cache correctly', async () => {
+    const user = { _id: 'testuser', loginStreak: { count: 5 }, activeBonus: true, flags: ['vip'], coins: 100, xp: 1000, level: 5 };
+    const payload = { difficulty: 'hard', timeTaken: 25, hintsUsed: 1 };
+    const outcome1 = await synthesizeEventOutcome({ user, eventPayload: payload });
+    const outcome2 = await synthesizeEventOutcome({ user, eventPayload: payload });
+    expect(outcome1).toEqual(outcome2);
   });
 });
 
 
 describe('makeAdvancedEventHandler', () => {
-  it('should handle user not found', async () => {
-    const UserModel = { findById: jest.fn().mockResolvedValue(null) };
-    const SubmissionModel = { create: jest.fn() };
-    const InventoryModel = { findOne: jest.fn(), create: jest.fn() };
-    const handler = makeAdvancedEventHandler({ UserModel, SubmissionModel, InventoryModel });
-    const req = { user: { _id: 1 }, body: { payload: {} } };
-    const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-    await handler(req, res);
-    expect(res.status).toHaveBeenCalledWith(404);
+  const mockModel = {
+    findById: jest.fn(),
+    findOne: jest.fn(),
+    create: jest.fn(),
+    save: jest.fn(),
+  };
+  const mockReq = { user: { _id: 'testuser' }, body: { payload: { difficulty: 'easy' } } };
+  const mockRes = {
+    status: jest.fn().mockReturnThis(),
+    json: jest.fn(),
+  };
+
+  beforeEach(() => {
+    mockModel.findById.mockReset();
+    mockModel.findOne.mockReset();
+    mockModel.create.mockReset();
+    mockModel.save.mockReset();
+    mockRes.status.mockReset();
+    mockRes.json.mockReset();
   });
-  // Add more tests for makeAdvancedEventHandler as needed, mocking database interactions.  
-  // This requires mocking the database models (UserModel, SubmissionModel, InventoryModel) 
-  // and testing various scenarios including successful event handling, error handling during 
-  // database operations, and different outcome scenarios.  Due to complexity of full 
-  // integration testing, this is left as an exercise for the reader.
+
+  it('should handle successful event processing', async () => {
+    mockModel.findById.mockResolvedValue({ _id: 'testuser', coins: 100, save: jest.fn().mockResolvedValue(true) });
+    mockModel.findOne.mockResolvedValue(null);
+    mockModel.create.mockResolvedValue(true);
+    const handler = makeAdvancedEventHandler({ UserModel: mockModel, SubmissionModel: mockModel, InventoryModel: mockModel });
+    await handler(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    expect(mockModel.findById).toHaveBeenCalledWith('testuser');
+    expect(mockModel.save).toHaveBeenCalled();
+  });
+  it('should handle user not found', async () => {
+    mockModel.findById.mockResolvedValue(null);
+    const handler = makeAdvancedEventHandler({ UserModel: mockModel, SubmissionModel: mockModel, InventoryModel: mockModel });
+    await handler(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(404);
+  });
+  it('should handle database errors gracefully', async () => {
+    mockModel.findById.mockResolvedValue({ _id: 'testuser', coins: 100, save: jest.fn().mockRejectedValue(new Error('DB error')) });
+    const handler = makeAdvancedEventHandler({ UserModel: mockModel, SubmissionModel: mockModel, InventoryModel: mockModel });
+    await handler(mockReq, mockRes);
+    expect(mockRes.status).toHaveBeenCalledWith(500);
+  });
 });

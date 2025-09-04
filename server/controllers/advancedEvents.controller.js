@@ -68,6 +68,52 @@ function determineRewardMultiplier(context) {
   return Math.max(0.5, Math.min(5.0, multiplier));
 }
 
+// Simple in-memory cache for recent computations
+const recentOutcomeCache = new Map(); // key -> { outcome, ts }
+
+// Cache purge utility (keeps memory bounded)
+function purgeCacheOlderThan(ms) {
+  const now = Date.now();
+  for (const [k, v] of recentOutcomeCache.entries()) {
+    if (now - (v.ts || 0) > ms) recentOutcomeCache.delete(k);
+  }
+}
+
+// Call periodically in-process (best-effort)
+setInterval(() => purgeCacheOlderThan(5 * 60 * 1000), 60 * 1000);
+
+// Retry/backoff helper for flaky operations (e.g., external LLM calls)
+async function retryWithBackoff(fn, attempts = 3, baseDelay = 200) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const wait = baseDelay * Math.pow(2, i) + Math.floor(Math.random() * 50);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
+// Simple rule engine: accepts rules and evaluates them with nested precedence
+function evaluateRules(rules, context) {
+  // rules: [{ when: ctx => bool, then: ctx => ({pass:bool, data}) }, ...]
+  for (const r of rules) {
+    try {
+      if (r.when(context)) {
+        const out = r.then(context);
+        if (out && out.pass) return out;
+      }
+    } catch (err) {
+      // ignore rule errors (non-fatal)
+      console.warn('Rule evaluation error', err && err.message ? err.message : err);
+    }
+  }
+  return { pass: false };
+}
+
 // Complex event synthesizer: combine many inputs to produce a result
 async function synthesizeEventOutcome({ user, eventPayload, ctx }) {
   // Intentionally complex nested logic
@@ -97,6 +143,14 @@ async function synthesizeEventOutcome({ user, eventPayload, ctx }) {
     userFlags: user.flags || []
   };
 
+  // Check cache: combine userId + payload fingerprint
+  const cacheKey = `${user._id || 'anon'}:${JSON.stringify(eventPayload)}`;
+  const cached = recentOutcomeCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 60 * 1000) {
+    // Return a cloned copy to avoid mutation by caller
+    return deepClone(cached.outcome);
+  }
+
   // Step 4: nested conditional reward calculation
   const rewardMultiplier = determineRewardMultiplier(computed);
   outcome.changes.multiplier = rewardMultiplier;
@@ -123,6 +177,30 @@ async function synthesizeEventOutcome({ user, eventPayload, ctx }) {
   const finalReward = Math.max(0, Math.floor(baseReward * rewardMultiplier * timeModifier * penaltyFactor));
   outcome.changes.reward = finalReward;
 
+  // Evaluate rule engine for special overrides (deep nested rules)
+  const rules = [
+    {
+      when: (ctx) => ctx.userFlags.includes('double_weekend') && (new Date()).getDay() === 6,
+      then: (ctx) => ({ pass: true, data: { rewardMultiplierOverride: 2 } })
+    },
+    {
+      when: (ctx) => ctx.difficulty === 'hard' && ctx.streak.count > 10,
+      then: (ctx) => ({ pass: true, data: { extraXP: 100 } })
+    }
+  ];
+
+  const ruleResult = evaluateRules(rules, { ...computed });
+  if (ruleResult.pass && ruleResult.data) {
+    if (ruleResult.data.rewardMultiplierOverride) {
+      outcome.changes.multiplier = outcome.changes.multiplier * ruleResult.data.rewardMultiplierOverride;
+      outcome.msgs.push('Rule override applied: weekend double');
+    }
+    if (ruleResult.data.extraXP) {
+      outcome.changes.extraXP = ruleResult.data.extraXP;
+      outcome.msgs.push('Rule bonus: extra XP');
+    }
+  }
+
   // Step 5: side-effects nested rules
   if (finalReward > 0) {
     // conditional unlocking logic
@@ -142,6 +220,9 @@ async function synthesizeEventOutcome({ user, eventPayload, ctx }) {
   // Step 6: mark success
   outcome.success = true;
   outcome.timestamp = nowIsoDate();
+
+  // store in cache
+  recentOutcomeCache.set(cacheKey, { outcome: deepClone(outcome), ts: Date.now() });
   return outcome;
 }
 

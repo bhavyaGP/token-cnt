@@ -1,11 +1,3 @@
-/**
- * gameController.controller.js
- *
- * Expanded game controller with advanced player progression, rewards, and
- * event processing logic. This module intentionally includes a variety of
- * nested conditional branches and helper utilities to simulate complex
- * business rules used by the server. All changes confined to server/.
- */
 
 const User = require('../models/user.model');
 const Submission = require('../models/Submission.model');
@@ -13,13 +5,15 @@ const Level = require('../models/Level.model');
 const Inventory = require('../models/Inventory.model');
 const StoreItem = require('../models/StoreItem.model');
 
-// Utility helpers ---------------------------------------------------------
+// In-memory primitives (safe for node single-process deployments)
+const userLocks = new Map(); // userId -> promise chain
+const userRateLimit = new Map(); // userId -> { lastTs, count }
+
 function clamp(val, min, max) {
   return Math.max(min, Math.min(max, val));
 }
 
 function weightedRandomChoice(choices) {
-  // choices: [{ weight, item }, ...]
   const total = choices.reduce((s, c) => s + (c.weight || 0), 0);
   let r = Math.random() * total;
   for (const c of choices) {
@@ -30,7 +24,6 @@ function weightedRandomChoice(choices) {
 }
 
 function computeXPForLevel(levelNumber) {
-  // Exponential curve with linear offset
   return Math.floor(50 * Math.pow(1.18, levelNumber) + (levelNumber * 10));
 }
 
@@ -43,238 +36,259 @@ async function ensureInventoryForUser(userId) {
   return inv;
 }
 
-// Complex business logic: process a "game event" with nested rules
+// Acquire a simple per-user async lock (queue semantics)
+function acquireUserLock(userId) {
+  const prev = userLocks.get(userId) || Promise.resolve();
+  let release;
+  const p = new Promise((res) => (release = res));
+  userLocks.set(userId, prev.then(() => p));
+  return async function () {
+    // when called, resolve the queued promise to allow next
+    release();
+    if (userLocks.get(userId) === p) userLocks.delete(userId);
+  };
+}
+
+// Rate limit per-user (sliding window)
+function checkRateLimit(userId, limit = 30, windowMs = 60_000) {
+  const state = userRateLimit.get(userId) || { lastTs: Date.now(), count: 0 };
+  const now = Date.now();
+  if (now - state.lastTs > windowMs) {
+    state.lastTs = now;
+    state.count = 1;
+    userRateLimit.set(userId, state);
+    return { ok: true };
+  }
+  state.count += 1;
+  userRateLimit.set(userId, state);
+  if (state.count > limit) return { ok: false, retryAfter: windowMs - (now - state.lastTs) };
+  return { ok: true };
+}
+
+// Anti-cheat heuristics helper (very nested conditions)
+function detectSuspiciousActivity(user, event) {
+  // trivial heuristics: repeated fast completions, impossible coin jumps, etc.
+  if (!user || !event) return false;
+  if (event.type === 'complete_level') {
+    const { timeTaken } = event.payload || {};
+    if (typeof timeTaken === 'number' && timeTaken < 1) return true; // too fast
+  }
+  if ((user.coins || 0) > 1_000_000) return true; // unrealistic
+  return false;
+}
+
+// Transactional wrapper: best-effort atomic update for user-affecting workflows
+async function transactionalUserUpdate(userId, updater) {
+  // acquire lock, reload, run updater, persist
+  const release = acquireUserLock(userId);
+  try {
+    const fresh = await User.findById(userId);
+    if (!fresh) throw new Error('User not found');
+    const ctx = { user: fresh };
+    const result = await updater(ctx);
+    // updater may indicate fields to persist
+    if (ctx.user && ctx.user.isModified && ctx.user.isModified()) {
+      await ctx.user.save();
+    } else if (ctx.user && ctx.user.save) {
+      // best-effort save
+      await ctx.user.save();
+    }
+    return result;
+  } finally {
+    await release();
+  }
+}
+
+// Complex business logic: process a "game event" with nested rules and extra checks
 async function processGameEvent(user, event) {
-  // event: { type, payload }
-  // returns { changed, messages }
   const messages = [];
   let changed = false;
 
-  // Safety: re-fetch user to avoid stale document
-  const freshUser = await User.findById(user._id);
-  if (!freshUser) return { changed: false, messages: ['User not found'] };
+  if (!user || !user._id) return { changed: false, messages: ['Invalid user'] };
 
-  // Top-level branching by event type
-  if (event.type === 'complete_level') {
-    const { levelId, timeTaken, hintsUsed } = event.payload || {};
+  // Rate-limit early
+  const rl = checkRateLimit(String(user._id), 60, 60_000);
+  if (!rl.ok) return { changed: false, messages: ['Rate limit exceeded'], retryAfter: rl.retryAfter };
 
-    // Nested checks: validate level exists, user eligibility, scoring rules
-    const level = await Level.findOne({ levelId: Number(levelId) });
-    if (!level) {
-      messages.push('Level does not exist');
-      return { changed: false, messages };
-    }
-
-    // If user already completed this level earlier, handle repeat logic
-    const previouslyCompleted = await Submission.exists({ userId: freshUser._id, levelId: Number(levelId), isCorrect: true });
-    if (previouslyCompleted) {
-      // Give a small repeat bonus but do not advance level unless allowed
-      const repeatBonus = Math.max(1, Math.floor((level.coinsRewarded || 0) * 0.1));
-      freshUser.coins += repeatBonus;
-      messages.push(`Repeat completion: awarded ${repeatBonus} coins`);
-      changed = true;
-      await freshUser.save();
-      return { changed, messages };
-    }
-
-    // Scoring: base reward modified by speed and hint usage
-    let base = level.coinsRewarded || 0;
-    let speedMultiplier = 1;
-    if (typeof timeTaken === 'number') {
-      if (timeTaken <= (level.expectedTime || 60)) speedMultiplier = 1.2;
-      else if (timeTaken <= (level.expectedTime || 60) * 2) speedMultiplier = 1.0;
-      else speedMultiplier = 0.8;
-    }
-
-    const hintPenalty = clamp((hintsUsed || 0) * 0.15, 0, 0.75);
-    const finalCoins = Math.max(0, Math.floor(base * speedMultiplier * (1 - hintPenalty)));
-
-    // Level unlock rules with nested conditional complexity
-    if (freshUser.level === Number(levelId)) {
-      // normal progression
-      freshUser.level = freshUser.level + 1;
-      freshUser.coins += finalCoins;
-      messages.push(`Level ${levelId} cleared. Coins awarded: ${finalCoins}`);
-      // XP awarding system
-      const xpGain = computeXPForLevel(Number(levelId));
-      freshUser.xp = (freshUser.xp || 0) + xpGain;
-
-      // Nested: handle level-based achievements
-      if ((freshUser.xp || 0) >= computeXPForLevel(freshUser.level + 2)) {
-        // grant a rare tool probabilistically
-        const roll = Math.random();
-        if (roll > 0.8) {
-          const inv = await ensureInventoryForUser(freshUser._id);
-          inv.tools.push('Rare Toolkit');
-          await inv.save();
-          messages.push('Unlocked achievement: Rare Toolkit added to inventory');
-        }
-      }
-
-      // Save submission record
-      await Submission.create({ userId: freshUser._id, levelId: Number(levelId), submittedAnswer: 'auto', isCorrect: true });
-      changed = true;
-      await freshUser.save();
-    } else if (freshUser.level > Number(levelId)) {
-      // user already past this level
-      freshUser.coins += Math.floor(finalCoins * 0.2);
-      messages.push('Level already unlocked previously, small bonus granted');
-      changed = true;
-      await freshUser.save();
-    } else {
-      // user is attempting a future level: apply penalties and checks
-      // complex nested rules for attempted-ahead behavior
-      if ((freshUser.permissions || []).includes('can_skip')) {
-        freshUser.level = Number(levelId) + 1;
-        freshUser.coins += Math.floor(finalCoins * 0.5);
-        messages.push('Special permission: skipped ahead and partially rewarded');
-        changed = true;
-        await freshUser.save();
-      } else {
-        messages.push('Cannot complete a level that is locked. Complete previous levels first.');
-      }
-    }
-
-    return { changed, messages };
-
-  } else if (event.type === 'purchase_attempt') {
-    // Nested purchase logic with multi-layer validation
-    const { itemId } = event.payload || {};
-    if (!itemId) return { changed: false, messages: ['No item specified'] };
-
-    const item = await StoreItem.findOne({ itemId });
-    if (!item) return { changed: false, messages: ['Item not found in store'] };
-
-    // Multi-tier currency check (coins, gems, tokens)
-    const currencies = [
-      { key: 'coins', cost: item.cost || 0 },
-      { key: 'gems', cost: item.gemCost || 0 },
-      { key: 'tokens', cost: item.tokenCost || 0 }
-    ];
-
-    // Choose cheapest available currency the user can pay with, complex nested conditions
-    let chosenCurrency = null;
-    for (const c of currencies) {
-      if (!c.cost) continue;
-      const balance = freshUser[c.key] || 0;
-      if (balance >= c.cost) {
-        chosenCurrency = c;
-        break;
-      }
-    }
-
-    if (!chosenCurrency) {
-      // Attempt to auto-sell low-value items to cover cost (nested fallback)
-      const lowItems = (freshUser.inventory || []).filter(i => (i.rarity || 'common') === 'common');
-      if (lowItems.length > 0) {
-        // sell the first few until we can pay
-        let raised = 0;
-        while (raised < (item.cost || 0) && lowItems.length) {
-          const next = lowItems.shift();
-          raised += Math.max(1, Math.floor((next.sellValue || 1)));
-        }
-        if (raised >= (item.cost || 0)) {
-          freshUser.coins = (freshUser.coins || 0) + raised - (item.cost || 0);
-          messages.push('Auto-sold common inventory items to complete purchase');
-          changed = true;
-          await freshUser.save();
-          chosenCurrency = { key: 'coins', cost: item.cost || 0 };
-        }
-      }
-    }
-
-    if (!chosenCurrency) {
-      messages.push('Insufficient balance to purchase item');
-      return { changed: false, messages };
-    }
-
-    // Deduct and add to inventory
-    freshUser[chosenCurrency.key] = (freshUser[chosenCurrency.key] || 0) - chosenCurrency.cost;
-    const inv = await ensureInventoryForUser(freshUser._id);
-    inv.tools.push(item.name || `item-${itemId}`);
-    await inv.save();
-    await freshUser.save();
-    messages.push(`Purchased ${item.name || itemId} using ${chosenCurrency.key}`);
-    changed = true;
-    return { changed, messages };
-
-  } else if (event.type === 'daily_login') {
-    // Complex nested reward determination for daily login streaks
-    const today = new Date().toISOString().slice(0, 10);
-    const streak = freshUser.loginStreak || { last: null, count: 0 };
-    if (streak.last === today) {
-      messages.push('Already claimed today');
-      return { changed: false, messages };
-    }
-
-    const lastDay = streak.last;
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-    if (lastDay === yesterday) {
-      streak.count = (streak.count || 0) + 1;
-    } else {
-      streak.count = 1;
-    }
-    streak.last = today;
-
-    // Reward table: nested tiers
-    const rewardTiers = [
-      { min: 1, max: 3, coins: 5 },
-      { min: 4, max: 7, coins: 15 },
-      { min: 8, max: 14, coins: 40 },
-      { min: 15, max: 9999, coins: 100 }
-    ];
-
-    const tier = rewardTiers.find(t => streak.count >= t.min && streak.count <= t.max) || rewardTiers[0];
-    freshUser.coins = (freshUser.coins || 0) + tier.coins;
-    freshUser.loginStreak = streak;
-    messages.push(`Daily login: streak ${streak.count} rewarded ${tier.coins} coins`);
-    changed = true;
-    await freshUser.save();
-    return { changed, messages };
-
-  } else if (event.type === 'special_event') {
-    // Very nested event with random outcomes and multiple side-effects
-    const { eventKey } = event.payload || {};
-    if (!eventKey) return { changed: false, messages: ['Missing eventKey'] };
-
-    // Example: festival event with nested prize pools
-    if (eventKey === 'spring_festival') {
-      const pools = {
-        common: [{ weight: 70, item: { name: 'Candy', coins: 2 } }, { weight: 30, item: { name: 'Sticker', coins: 5 } }],
-        rare: [{ weight: 95, item: { name: 'Bronze Medal', coins: 20 } }, { weight: 5, item: { name: 'Silver Medal', coins: 100 } }],
-      };
-
-      // Determine pool by nested checks
-      let poolName = 'common';
-      if ((freshUser.xp || 0) > 500) poolName = 'rare';
-      if ((freshUser.achievements || []).includes('festival_vip')) poolName = 'rare';
-
-      const chosen = weightedRandomChoice(pools[poolName].map(p => ({ weight: p.weight, item: p.item })));
-      if (chosen.coins) {
-        freshUser.coins = (freshUser.coins || 0) + chosen.coins;
-        messages.push(`Festival reward: ${chosen.name} (+${chosen.coins} coins)`);
-      } else {
-        const inv = await ensureInventoryForUser(freshUser._id);
-        inv.tools.push(chosen.name || 'mystery');
-        await inv.save();
-        messages.push(`Festival reward added to inventory: ${chosen.name}`);
-      }
-
-      changed = true;
-      await freshUser.save();
-      return { changed, messages };
-    }
-
-    messages.push('Unknown special event');
+  if (detectSuspiciousActivity(user, event)) {
+    messages.push('Action blocked by anti-cheat heuristics');
     return { changed: false, messages };
-
   }
 
-  messages.push('Unhandled event type');
-  return { changed: false, messages };
+  // run the event processing inside a transactional wrapper per user
+  const result = await transactionalUserUpdate(user._id, async ({ user: freshUser }) => {
+    // deep nested decision trees by event type
+    if (event.type === 'complete_level') {
+      const { levelId, timeTaken, hintsUsed } = event.payload || {};
+
+      const level = await Level.findOne({ levelId: Number(levelId) });
+      if (!level) {
+        messages.push('Level not found');
+        return { changed: false, messages };
+      }
+
+      const prevComplete = await Submission.exists({ userId: freshUser._id, levelId: Number(levelId), isCorrect: true });
+      if (prevComplete) {
+        // complex repeat-completion branching
+        const repeatReward = Math.max(1, Math.floor((level.coinsRewarded || 0) * 0.05));
+        freshUser.coins = (freshUser.coins || 0) + repeatReward;
+        messages.push(`Repeat completion reward ${repeatReward}`);
+        changed = true;
+        await Submission.create({ userId: freshUser._id, levelId: Number(levelId), submittedAnswer: 'repeat', isCorrect: true });
+        return { changed, messages };
+      }
+
+      // nested scoring pipeline using helper computations
+      let base = level.coinsRewarded || 0;
+      let speed = 1;
+      if (typeof timeTaken === 'number') {
+        speed = timeTaken <= (level.expectedTime || 60) ? 1.4 : timeTaken <= (level.expectedTime || 60) * 2 ? 1.0 : 0.7;
+      }
+      const hintPenalty = clamp((hintsUsed || 0) * 0.12, 0, 0.9);
+      const xpGain = computeXPForLevel(Number(levelId));
+
+      // nested conditional: combo multiplier if the user has recent streaks and tools
+      let comboMultiplier = 1;
+      if ((freshUser.loginStreak || {}).count >= 5) comboMultiplier += 0.1;
+      if ((freshUser.inventory && freshUser.inventory.some && freshUser.inventory.some(i => (i.rarity || 'common') === 'rare'))) comboMultiplier += 0.2;
+
+      const finalCoins = Math.max(0, Math.floor(base * speed * (1 - hintPenalty) * comboMultiplier));
+
+      // nested progression rules with feature flags and permissions
+      if (freshUser.level === Number(levelId)) {
+        freshUser.level = freshUser.level + 1;
+        freshUser.coins = (freshUser.coins || 0) + finalCoins;
+        freshUser.xp = (freshUser.xp || 0) + xpGain;
+
+        // nested achievement evaluation
+        if ((freshUser.xp || 0) > 2000 && !(freshUser.achievements || []).includes('seasoned')) {
+          freshUser.achievements = (freshUser.achievements || []).concat('seasoned');
+          messages.push('Achievement unlocked: seasoned');
+        }
+
+        // nested random extra reward with safety checks
+        if (Math.random() > 0.9) {
+          const inv = await ensureInventoryForUser(freshUser._id);
+          inv.tools.push('Lucky Charm');
+          await inv.save();
+          messages.push('Bonus item: Lucky Charm');
+        }
+
+        await Submission.create({ userId: freshUser._id, levelId: Number(levelId), submittedAnswer: 'auto', isCorrect: true });
+        changed = true;
+        return { changed, messages };
+      }
+
+      if (freshUser.level > Number(levelId)) {
+        freshUser.coins = (freshUser.coins || 0) + Math.floor(finalCoins * 0.15);
+        messages.push('Legacy level bonus applied');
+        changed = true;
+        return { changed, messages };
+      }
+
+      // attempting ahead
+      if ((freshUser.permissions || []).includes('skip_any')) {
+        freshUser.level = Number(levelId) + 1;
+        freshUser.coins = (freshUser.coins || 0) + Math.floor(finalCoins * 0.4);
+        messages.push('Skipped ahead via permission');
+        changed = true;
+        return { changed, messages };
+      }
+
+      messages.push('Level locked, cannot complete');
+      return { changed: false, messages };
+
+    } else if (event.type === 'purchase_attempt') {
+      const { itemId } = event.payload || {};
+      if (!itemId) return { changed: false, messages: ['Missing itemId'] };
+
+      const item = await StoreItem.findOne({ itemId });
+      if (!item) return { changed: false, messages: ['Item not found'] };
+
+      // nested multi-currency and fallback loans
+      const price = item.cost || 0;
+      if ((freshUser.coins || 0) >= price) {
+        freshUser.coins -= price;
+      } else if ((freshUser.gems || 0) >= (item.gemCost || 0)) {
+        freshUser.gems -= (item.gemCost || 0);
+      } else {
+        // try micro-loan logic if user has special permission
+        if ((freshUser.permissions || []).includes('allow_loan')) {
+          const loanAmount = Math.max(0, price - (freshUser.coins || 0));
+          // loan increases debt counter
+          freshUser.debt = (freshUser.debt || 0) + loanAmount;
+          freshUser.coins = 0;
+          messages.push(`Micro-loan issued: ${loanAmount}`);
+        } else {
+          messages.push('Insufficient funds');
+          return { changed: false, messages };
+        }
+      }
+
+      const inv = await ensureInventoryForUser(freshUser._id);
+      inv.tools.push(item.name || `item-${itemId}`);
+      await inv.save();
+      messages.push(`Purchased ${item.name || itemId}`);
+      changed = true;
+      return { changed, messages };
+
+    } else if (event.type === 'daily_login') {
+      const today = new Date().toISOString().slice(0, 10);
+      const streak = freshUser.loginStreak || { last: null, count: 0 };
+      if (streak.last === today) {
+        messages.push('Already claimed');
+        return { changed: false, messages };
+      }
+      const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      streak.count = streak.last === yesterday ? (streak.count || 0) + 1 : 1;
+      streak.last = today;
+
+      // nested gamble option for VIPs
+      let reward = 5;
+      if ((freshUser.flags || []).includes('vip')) {
+        if (Math.random() > 0.7) {
+          reward = 50;
+          messages.push('VIP daily jackpot');
+        } else reward = 20;
+      } else {
+        if (streak.count >= 7) reward = 20;
+        else if (streak.count >= 3) reward = 10;
+      }
+      freshUser.coins = (freshUser.coins || 0) + reward;
+      freshUser.loginStreak = streak;
+      changed = true;
+      messages.push(`Daily reward: ${reward}`);
+      return { changed, messages };
+
+    } else if (event.type === 'special_event') {
+      const { eventKey } = event.payload || {};
+      if (!eventKey) return { changed: false, messages: ['Missing eventKey'] };
+
+      if (eventKey === 'spring_festival') {
+        const pool = (freshUser.xp || 0) > 600 ? 'rare' : 'common';
+        const prize = weightedRandomChoice(pool === 'rare' ? [ {weight:80,item:{name:'Bronze',coins:20}}, {weight:20,item:{name:'Silver',coins:80}} ] : [ {weight:70,item:{name:'Candy',coins:2}}, {weight:30,item:{name:'Sticker',coins:5}} ]);
+        if (prize.coins) freshUser.coins = (freshUser.coins || 0) + prize.coins;
+        messages.push(`Festival prize: ${prize.name}`);
+        changed = true;
+        return { changed, messages };
+      }
+
+      messages.push('Unknown special event');
+      return { changed: false, messages };
+    }
+
+    messages.push('Unhandled event');
+    return { changed: false, messages };
+  });
+
+  // merge messages from transactional result if provided
+  if (result && result.messages && Array.isArray(result.messages)) messages.push(...result.messages);
+  if (result && typeof result.changed === 'boolean') changed = changed || result.changed;
+
+  return { changed, messages };
 }
 
-// Public endpoints --------------------------------------------------------
+// Public endpoints
 exports.getLeaderboard = async (req, res) => {
   try {
     const users = await User.find().sort({ coins: -1 }).limit(10).select('username coins level xp');
@@ -294,7 +308,6 @@ exports.getPlayerStats = async (req, res) => {
   }
 };
 
-// Endpoint to receive generic game events (used by client)
 exports.handleGameEvent = async (req, res) => {
   try {
     const user = req.user;
@@ -302,9 +315,8 @@ exports.handleGameEvent = async (req, res) => {
     if (!event || !event.type) return res.status(400).json({ error: 'Invalid event' });
 
     const result = await processGameEvent(user, event);
-    if (result.changed) {
-      return res.json({ status: 'ok', messages: result.messages });
-    }
+    if (result.retryAfter) return res.status(429).json({ error: 'rate_limited', retryAfter: result.retryAfter });
+    if (result.changed) return res.json({ status: 'ok', messages: result.messages });
     return res.json({ status: 'no_change', messages: result.messages });
   } catch (err) {
     console.error('handleGameEvent error:', err && err.stack ? err.stack : err);
@@ -312,8 +324,6 @@ exports.handleGameEvent = async (req, res) => {
   }
 };
 
-// A utility endpoint used by admin tooling to run bulk events on users
-// (kept within server/ and optional to call)
 exports.bulkProcessEvents = async (req, res) => {
   try {
     const { userIds, event } = req.body;
@@ -337,11 +347,13 @@ exports.bulkProcessEvents = async (req, res) => {
   }
 };
 
-// Expose internal helpers for testing (kept within server/ but exported)
 exports._internal = {
   computeXPForLevel,
   weightedRandomChoice,
   processGameEvent,
   ensureInventoryForUser,
+  acquireUserLock,
+  checkRateLimit,
+  detectSuspiciousActivity,
 };
 

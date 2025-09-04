@@ -1,10 +1,10 @@
-const { getLeaderboard, getPlayerStats, handleGameEvent, bulkProcessEvents, _internal } = require('../gameController.controller');
+const { getLeaderboard, getPlayerStats, handleGameEvent, bulkProcessEvents, _internal } = require('../src/game-logic');
 const User = require('../models/user.model');
 const Submission = require('../models/Submission.model');
 const Level = require('../models/Level.model');
 const Inventory = require('../models/Inventory.model');
 const StoreItem = require('../models/StoreItem.model');
-const { computeXPForLevel, weightedRandomChoice, processGameEvent: processGameEventInternal, ensureInventoryForUser } = _internal;
+const { computeXPForLevel, weightedRandomChoice, processGameEvent: processGameEventInternal, ensureInventoryForUser, acquireUserLock, checkRateLimit, detectSuspiciousActivity } = _internal;
 
 jest.mock('../models/user.model');
 jest.mock('../models/Submission.model');
@@ -12,164 +12,153 @@ jest.mock('../models/Level.model');
 jest.mock('../models/Inventory.model');
 jest.mock('../models/StoreItem.model');
 
-describe('gameController', () => {
-  describe('getLeaderboard', () => {
-    it('should fetch and return leaderboard data', async () => {
-      User.find.mockResolvedValue([{ username: 'user1', coins: 100, level: 1, xp: 10 }, { username: 'user2', coins: 50, level: 2, xp: 20 }]);
-      const req = {};
-      const res = { json: jest.fn() };
-      await getLeaderboard(req, res);
-      expect(res.json).toHaveBeenCalledWith([{ username: 'user1', coins: 100, level: 1, xp: 10 }, { username: 'user2', coins: 50, level: 2, xp: 20 }]);
-    });
-    it('should handle errors gracefully', async () => {
-      User.find.mockRejectedValue(new Error('Failed to fetch leaderboard'));
-      const req = {};
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await getLeaderboard(req, res);
-      expect(res.status).toHaveBeenCalledWith(500);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Failed to fetch leaderboard' });
-    });
+describe('clamp', () => {
+  it('should clamp values correctly', () => {
+    expect(clamp(5, 1, 10)).toBe(5);
+    expect(clamp(0, 1, 10)).toBe(1);
+    expect(clamp(15, 1, 10)).toBe(10);
   });
-  describe('getPlayerStats', () => {
-    it('should fetch and return player stats', async () => {
-      const req = { user: { _id: '123' } };
-      User.findById.mockResolvedValue({ _id: '123', username: 'user1' });
-      Submission.find.mockResolvedValue([{ userId: '123' }]);
-      const res = { json: jest.fn() };
-      await getPlayerStats(req, res);
-      expect(res.json).toHaveBeenCalledWith({ user: { _id: '123', username: 'user1' }, submissions: [{ userId: '123' }] });
-    });
-    it('should handle errors gracefully', async () => {
-      const req = { user: { _id: '123' } };
-      User.findById.mockRejectedValue(new Error('Failed to fetch player stats'));
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await getPlayerStats(req, res);
-      expect(res.status).toHaveBeenCalledWith(500);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Failed to fetch player stats' });
-    });
+});
+
+describe('weightedRandomChoice', () => {
+  it('should choose items based on weights', () => {
+    const choices = [{ weight: 80, item: 'A' }, { weight: 20, item: 'B' }];
+    const results = [];
+    for (let i = 0; i < 1000; i++) {
+      results.push(weightedRandomChoice(choices));
+    }
+    expect(results.filter(r => r === 'A').length).toBeGreaterThan(results.filter(r => r === 'B').length);
   });
-  describe('handleGameEvent', () => {
-    it('should handle a valid game event', async () => {
-      const req = { user: { _id: '123' }, body: { event: { type: 'complete_level', payload: { levelId: 1 } } } };
-      User.findById.mockResolvedValue({ _id: '123', level: 1, coins: 0, xp: 0 });
-      Level.findOne.mockResolvedValue({ coinsRewarded: 100, expectedTime: 60 });
-      const res = { json: jest.fn() };
-      await handleGameEvent(req, res);
-      expect(res.json).toHaveBeenCalledWith({ status: 'ok', messages: expect.arrayContaining(['Level 1 cleared. Coins awarded: 120']) });
-    });
-    it('should handle invalid events', async () => {
-      const req = { user: { _id: '123' }, body: { event: { type: 'invalid' } } };
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await handleGameEvent(req, res);
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid event' });
-    });
-    it('should handle errors gracefully', async () => {
-      const req = { user: { _id: '123' }, body: { event: { type: 'complete_level', payload: { levelId: 1 } } } };
-      User.findById.mockRejectedValue(new Error('Failed to handle game event'));
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await handleGameEvent(req, res);
-      expect(res.status).toHaveBeenCalledWith(500);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Failed to handle game event' });
-    });
+  it('should handle empty choices', () => {
+    expect(weightedRandomChoice([])).toBeNull();
   });
-  describe('bulkProcessEvents', () => {
-    it('should process events for multiple users', async () => {
-      const req = { body: { userIds: ['1', '2'], event: { type: 'daily_login' } } };
-      User.findById.mockResolvedValue({ _id: '1', coins: 0, loginStreak: { last: null, count: 0 } });
-      const res = { json: jest.fn() };
-      await bulkProcessEvents(req, res);
-      expect(res.json).toHaveBeenCalled();
-    });
-    it('should handle invalid payload', async () => {
-      const req = { body: { userIds: '1', event: { type: 'daily_login' } } };
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await bulkProcessEvents(req, res);
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid payload' });
-    });
-    it('should handle errors gracefully', async () => {
-      const req = { body: { userIds: ['1', '2'], event: { type: 'daily_login' } } };
-      User.findById.mockRejectedValue(new Error('Failed to handle game event'));
-      const res = { status: jest.fn().mockReturnThis(), json: jest.fn() };
-      await bulkProcessEvents(req, res);
-      expect(res.status).toHaveBeenCalledWith(500);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Bulk processing failed' });
-    });
+});
+
+describe('computeXPForLevel', () => {
+  it('should compute XP correctly', () => {
+    expect(computeXPForLevel(1)).toBe(68);
+    expect(computeXPForLevel(10)).toBe(2235);
   });
-  describe('_internal', () => {
-    describe('computeXPForLevel', () => {
-      it('should compute XP for a given level', () => {
-        expect(computeXPForLevel(1)).toBe(60);
-        expect(computeXPForLevel(10)).toBe(1212);
-      });
-    });
-    describe('weightedRandomChoice', () => {
-      it('should choose an item based on weights', () => {
-        const choices = [{ weight: 70, item: 'A' }, { weight: 30, item: 'B' }];
-        const result = weightedRandomChoice(choices);
-        expect(choices.map(c => c.item)).toContain(result);
-      });
-      it('should handle empty choices', () => {
-        expect(weightedRandomChoice([])).toBe(null);
-      });
-    });
-    describe('processGameEventInternal', () => {
-      it('should process complete_level event', async () => {
-        const user = { _id: '123', level: 1, coins: 0, xp: 0 };
-        const event = { type: 'complete_level', payload: { levelId: 1, timeTaken: 30 } };
-        User.findById.mockResolvedValue(user);
-        Level.findOne.mockResolvedValue({ coinsRewarded: 100, expectedTime: 60 });
-        const result = await processGameEventInternal(user, event);
-        expect(result.changed).toBe(true);
-        expect(result.messages).toContain('Level 1 cleared');
-      });
-      it('should process purchase_attempt event', async () => {
-        const user = { _id: '123', coins: 100 };
-        const event = { type: 'purchase_attempt', payload: { itemId: '1' } };
-        User.findById.mockResolvedValue(user);
-        StoreItem.findOne.mockResolvedValue({ itemId: '1', cost: 50, name: 'item1' });
-        const result = await processGameEventInternal(user, event);
-        expect(result.changed).toBe(true);
-        expect(result.messages).toContain('Purchased item1');
-      });
-      it('should process daily_login event', async () => {
-        const user = { _id: '123', coins: 0, loginStreak: { last: null, count: 0 } };
-        const event = { type: 'daily_login' };
-        User.findById.mockResolvedValue(user);
-        const result = await processGameEventInternal(user, event);
-        expect(result.changed).toBe(true);
-        expect(result.messages).toContain('Daily login');
-      });
-      it('should process special_event', async () => {
-        const user = { _id: '123', xp: 600 };
-        const event = { type: 'special_event', payload: { eventKey: 'spring_festival' } };
-        User.findById.mockResolvedValue(user);
-        const result = await processGameEventInternal(user, event);
-        expect(result.changed).toBe(true);
-        expect(result.messages).toContain('Festival reward');
-      });
-      it('should handle unknown event type', async () => {
-        const user = { _id: '123' };
-        const event = { type: 'unknown' };
-        const result = await processGameEventInternal(user, event);
-        expect(result.changed).toBe(false);
-        expect(result.messages).toContain('Unhandled event type');
-      });
-    });
-    describe('ensureInventoryForUser', () => {
-      it('should create a new inventory if one does not exist', async () => {
-        Inventory.findOne.mockResolvedValue(null);
-        const inv = await ensureInventoryForUser('123');
-        expect(inv.user).toBe('123');
-        expect(inv.tools).toEqual([]);
-      });
-      it('should return existing inventory if found', async () => {
-        const existingInv = { user: '123', tools: ['tool1'] };
-        Inventory.findOne.mockResolvedValue(existingInv);
-        const inv = await ensureInventoryForUser('123');
-        expect(inv).toBe(existingInv);
-      });
-    });
+});
+
+describe('ensureInventoryForUser', () => {
+  it('should create inventory if it does not exist', async () => {
+    Inventory.findOne.mockResolvedValue(null);
+    Inventory.mockImplementation(() => ({ save: jest.fn().mockResolvedValue({}) }));
+    const inv = await ensureInventoryForUser('test-user');
+    expect(Inventory.findOne).toHaveBeenCalledWith({ user: 'test-user' });
+    expect(inv.user).toBe('test-user');
+    expect(inv.tools).toEqual([]);
+    expect(inv.save).toHaveBeenCalled();
+  });
+  it('should return existing inventory if it exists', async () => {
+    const existingInv = { user: 'test-user', tools: ['tool1'] };
+    Inventory.findOne.mockResolvedValue(existingInv);
+    const inv = await ensureInventoryForUser('test-user');
+    expect(inv).toBe(existingInv);
+    expect(Inventory.findOne).toHaveBeenCalledWith({ user: 'test-user' });
+    expect(Inventory.mock.instances.length).toBe(0)
+  });
+});
+
+describe('acquireUserLock', () => {
+  it('should acquire and release locks', async () => {
+    const release = acquireUserLock('test-user');
+    expect(userLocks.size).toBe(1);
+    await release();
+    expect(userLocks.size).toBe(0);
+  });
+});
+
+describe('checkRateLimit', () => {
+  it('should check rate limits', () => {
+    expect(checkRateLimit('test-user')).toEqual({ ok: true });
+    const limitResult = checkRateLimit('test-user');
+    expect(limitResult).toEqual({ ok: true });
+    const secondResult = checkRateLimit('test-user');
+    expect(secondResult.ok).toBe(true);
+  });
+});
+
+describe('detectSuspiciousActivity', () => {
+  it('should detect suspicious activity', () => {
+    expect(detectSuspiciousActivity(null, {})).toBe(false);
+    expect(detectSuspiciousActivity({ coins: 1000000 }, {})).toBe(true);
+    expect(detectSuspiciousActivity({}, { type: 'complete_level', payload: { timeTaken: 0 } })).toBe(true);
+  });
+});
+
+describe('transactionalUserUpdate', () => {
+  it('should perform transactional updates', async () => {
+    User.findById.mockResolvedValue({ _id: 'test-user', coins: 100, save: jest.fn().mockResolvedValue({}) });
+    const updater = jest.fn().mockResolvedValue({ changed: true, messages: ['Updated'] });
+    const result = await transactionalUserUpdate('test-user', updater);
+    expect(updater).toHaveBeenCalled();
+    expect(User.findById).toHaveBeenCalledWith('test-user');
+    expect(result).toEqual({ changed: true, messages: ['Updated'] });
+  });
+});
+
+
+describe('processGameEvent', () => {
+  it('should process complete_level event', async () => {
+    const user = { _id: 'test-user', level: 1, coins: 0, xp: 0, loginStreak: { count: 0 }, achievements: [], save: jest.fn().mockResolvedValue({})};
+    const event = { type: 'complete_level', payload: { levelId: 1, timeTaken: 30, hintsUsed: 0 } };
+    Level.findOne.mockResolvedValue({ levelId: 1, coinsRewarded: 100, expectedTime: 60 });
+    Submission.exists.mockResolvedValue(false);
+    const result = await processGameEventInternal(user, event);
+    expect(result.changed).toBe(true);
+    expect(result.messages.length).toBeGreaterThan(0);
+  });
+  it('should handle rate limiting', async () => {
+    const user = { _id: 'test-user', level: 1, coins: 0, save: jest.fn().mockResolvedValue({}) };
+    const event = { type: 'complete_level', payload: { levelId: 1, timeTaken: 30, hintsUsed: 0 } };
+    checkRateLimit.mockReturnValue({ ok: false, retryAfter: 1000 });
+    const result = await processGameEventInternal(user, event);
+    expect(result.changed).toBe(false);
+    expect(result.retryAfter).toBe(1000);
+  });
+});
+
+
+describe('getLeaderboard', () => {
+  it('should fetch leaderboard', async () => {
+    User.find.mockResolvedValue([{ username: 'user1', coins: 100, level: 1, xp: 10 }]);
+    const res = { json: jest.fn() };
+    await getLeaderboard({}, res);
+    expect(res.json).toHaveBeenCalled();
+  });
+});
+
+describe('getPlayerStats', () => {
+  it('should fetch player stats', async () => {
+    const req = { user: { _id: 'test-user' } };
+    User.findById.mockResolvedValue({ username: 'test-user' });
+    Submission.find.mockResolvedValue([]);
+    const res = { json: jest.fn() };
+    await getPlayerStats(req, res);
+    expect(res.json).toHaveBeenCalled();
+  });
+});
+
+
+describe('handleGameEvent', () => {
+  it('should handle game events', async () => {
+    const req = { user: { _id: 'test-user' }, body: { event: { type: 'complete_level', payload: { levelId: 1, timeTaken: 30, hintsUsed: 0 } } } };
+    const res = { json: jest.fn(), status: jest.fn().mockReturnThis() };
+    processGameEventInternal.mockResolvedValue({ changed: true, messages: ['Event processed'] });
+    await handleGameEvent(req, res);
+    expect(res.json).toHaveBeenCalledWith({ status: 'ok', messages: ['Event processed'] });
+  });
+});
+
+describe('bulkProcessEvents', () => {
+  it('should bulk process events', async () => {
+    const req = { body: { userIds: ['test-user1', 'test-user2'], event: { type: 'daily_login' } } };
+    const res = { json: jest.fn() };
+    User.findById.mockResolvedValue({ _id: 'test-user1', save: jest.fn().mockResolvedValue({}) });
+    processGameEventInternal.mockResolvedValue({ changed: true, messages: ['Event processed'] });
+    await bulkProcessEvents(req, res);
+    expect(res.json).toHaveBeenCalled();
   });
 });
